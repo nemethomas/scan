@@ -20,6 +20,7 @@ import time
 import shutil
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -41,13 +42,13 @@ LINUX_USER          = "tom"
 LINUX_CONSUME_PATH  = "/home/tom/docker/paperless/consume"
 SSH_KEY_PATH        = os.path.expanduser("~/.ssh/id_ed25519")
 
-# Seite gilt als leer, wenn weniger als X Zeichen Text vorhanden
-# (nach OCR)
+# Seite gilt als leer, wenn weniger als X Zeichen Text vorhanden (nach OCR)
 EMPTY_PAGE_THRESHOLD = 10
 
-# Warte-Logik: Scanner schreibt Datei ggf. noch
-FILE_STABLE_SECONDS = 1.0     # wie lange muss die Größe stabil bleiben
-FILE_WAIT_TIMEOUT   = 60.0    # max. warten (Sek.)
+# Warteschlangen-Einstellungen
+QUEUE_CHECK_INTERVAL = 5       # Sekunden zwischen jedem Queue-Check
+FILE_STABLE_SECONDS  = 10      # Datei muss X Sekunden stabil (gleiche Grösse) sein
+FILE_ZERO_TIMEOUT    = 60      # Nach X Sekunden mit 0kb → überspringen
 
 # OCR Einstellungen
 # Falls PATH-Probleme: setze hier z.B. OCRMY_PDF_BIN = "/opt/homebrew/bin/ocrmypdf"
@@ -68,40 +69,89 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# HILFSFUNKTIONEN
+# WARTESCHLANGE
 # ─────────────────────────────────────────────
 
-def wait_until_file_is_stable(path: str) -> bool:
-    """
-    Wartet, bis sich die Dateigröße für FILE_STABLE_SECONDS nicht ändert,
-    oder bis FILE_WAIT_TIMEOUT erreicht ist.
-    """
-    start = time.time()
-    last_size = -1
-    stable_since = None
+# { filepath: { "detected_at": float, "last_size": int, "stable_since": float|None } }
+_queue: dict = {}
+_queue_lock = threading.Lock()
 
+
+def queue_worker():
+    """
+    Läuft als Hintergrund-Thread.
+    Prüft alle QUEUE_CHECK_INTERVAL Sekunden jede Datei in der Warteschlange:
+      - 0kb seit > FILE_ZERO_TIMEOUT  → überspringen (Scanner-Fehler)
+      - Grösse stabil seit FILE_STABLE_SECONDS → verarbeiten
+    """
     while True:
-        try:
-            size = os.path.getsize(path)
-        except FileNotFoundError:
-            time.sleep(0.2)
-            if time.time() - start > FILE_WAIT_TIMEOUT:
-                return False
-            continue
+        time.sleep(QUEUE_CHECK_INTERVAL)
 
-        if size == last_size and size > 0:
-            if stable_since is None:
-                stable_since = time.time()
-            if time.time() - stable_since >= FILE_STABLE_SECONDS:
-                return True
-        else:
-            stable_since = None
-            last_size = size
+        with _queue_lock:
+            to_process = []
+            to_remove = []
 
-        if time.time() - start > FILE_WAIT_TIMEOUT:
-            return False
+            for path, state in _queue.items():
+                # Datei existiert noch?
+                if not os.path.exists(path):
+                    log.warning(f"  Queue: Datei verschwunden – entfernt: {path}")
+                    to_remove.append(path)
+                    continue
 
-        time.sleep(0.2)
+                size = os.path.getsize(path)
+                now = time.time()
+
+                # Noch 0kb?
+                if size == 0:
+                    elapsed = now - state["detected_at"]
+                    if elapsed > FILE_ZERO_TIMEOUT:
+                        log.warning(f"  Queue: Timeout (immer noch 0kb) – übersprungen: {path}")
+                        to_remove.append(path)
+                    else:
+                        log.info(f"  Queue: Warte auf Inhalt ({elapsed:.0f}s) – {Path(path).name}")
+                    continue
+
+                # Grösse hat sich geändert → stable_since zurücksetzen
+                if size != state["last_size"]:
+                    state["last_size"] = size
+                    state["stable_since"] = now
+                    log.info(f"  Queue: Grösse ändert sich ({size} bytes) – {Path(path).name}")
+                    continue
+
+                # Grösse gleich aber stable_since noch nicht gesetzt
+                if state["stable_since"] is None:
+                    state["stable_since"] = now
+                    continue
+
+                # Stabil seit X Sekunden?
+                stable_duration = now - state["stable_since"]
+                if stable_duration >= FILE_STABLE_SECONDS:
+                    log.info(f"  Queue: Datei stabil ({size} bytes, {stable_duration:.0f}s) → verarbeiten: {Path(path).name}")
+                    to_process.append(path)
+                    to_remove.append(path)
+                else:
+                    log.info(f"  Queue: Fast stabil ({stable_duration:.0f}/{FILE_STABLE_SECONDS}s) – {Path(path).name}")
+
+            for path in to_remove:
+                del _queue[path]
+
+        # Verarbeitung ausserhalb des Locks (damit Queue nicht blockiert)
+        for path in to_process:
+            process_pdf(path)
+
+
+def add_to_queue(path: str):
+    """Fügt eine neue Datei der Warteschlange hinzu."""
+    with _queue_lock:
+        if path in _queue:
+            return  # bereits in der Queue
+        _queue[path] = {
+            "detected_at": time.time(),
+            "last_size": -1,
+            "stable_since": None,
+        }
+    log.info(f"  Queue: Datei erkannt, warte auf Stabilität – {Path(path).name}")
+
 
 # ─────────────────────────────────────────────
 # OCR
@@ -110,7 +160,7 @@ def wait_until_file_is_stable(path: str) -> bool:
 def ocr_pdf(input_path: str) -> str:
     """
     Führt OCR auf input_path aus und gibt Pfad zur OCR-Version zurück.
-    output liegt im TEMP_FOLDER.
+    Output liegt im TEMP_FOLDER.
     """
     os.makedirs(TEMP_FOLDER, exist_ok=True)
     base_name = Path(input_path).stem
@@ -122,6 +172,7 @@ def ocr_pdf(input_path: str) -> str:
         "--skip-text",          # vorhandenen Text nicht erneut ocr'en
         "--deskew",             # Schieflage korrigieren
         "--rotate-pages",       # Seiten automatisch drehen
+        "--language", "deu+eng",
         "--output-type", "pdf",
         input_path,
         output_path,
@@ -151,8 +202,8 @@ def is_empty_page(page) -> bool:
         text = page.extract_text() or ""
         return len(text.strip()) < EMPTY_PAGE_THRESHOLD
     except Exception:
-        # im Zweifel NICHT als leer markieren (lieber behalten)
         return False
+
 
 def split_pdf(input_path: str) -> list[str]:
     """
@@ -199,25 +250,21 @@ def copy_to_dropbox(file_path: str):
     shutil.copy2(file_path, dest)
     log.info(f"  → Dropbox: {dest}")
 
+
 def copy_to_paperless(file_path: str):
     """Kopiert eine Datei via SFTP auf den Linux-Server."""
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=LINUX_HOST,
-            username=LINUX_USER,
-            key_filename=SSH_KEY_PATH
-        )
-
-        with ssh.open_sftp() as sftp:
-            remote_path = f"{LINUX_CONSUME_PATH}/{Path(file_path).name}"
-            sftp.put(file_path, remote_path)
-            log.info(f"  → Paperless (Linux): {remote_path}")
-
-        ssh.close()
-    except Exception as e:
-        log.error(f"  ✗ SFTP Fehler: {e}")
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        hostname=LINUX_HOST,
+        username=LINUX_USER,
+        key_filename=SSH_KEY_PATH
+    )
+    with ssh.open_sftp() as sftp:
+        remote_path = f"{LINUX_CONSUME_PATH}/{Path(file_path).name}"
+        sftp.put(file_path, remote_path)
+        log.info(f"  → Paperless (Linux): {remote_path}")
+    ssh.close()
 
 # ─────────────────────────────────────────────
 # HAUPTVERARBEITUNG
@@ -227,19 +274,14 @@ def process_pdf(file_path: str):
     """Verarbeitet ein einzelnes PDF komplett."""
     log.info(f"Verarbeite: {file_path}")
 
-    # Warten bis der Scanner wirklich fertig geschrieben hat
-    if not wait_until_file_is_stable(file_path):
-        log.error("  ✗ Datei wurde nicht stabil / Timeout – übersprungen")
-        return
-
     ocr_path = None
     output_files: list[str] = []
 
     try:
-        # 0) OCR
+        # 1) OCR
         ocr_path = ocr_pdf(file_path)
 
-        # 1) PDF splitten und leere Seiten entfernen (nach OCR)
+        # 2) PDF splitten und leere Seiten entfernen
         output_files = split_pdf(ocr_path)
 
         if not output_files:
@@ -248,33 +290,43 @@ def process_pdf(file_path: str):
 
         log.info(f"  {len(output_files)} Seite(n) nach Verarbeitung")
 
-        # 2) Jede Seite an beide Endpoints schicken
-        for f in output_files:
-            copy_to_dropbox(f)
-            copy_to_paperless(f)
+        # 3) Jede Seite an beide Endpoints schicken
+        # Erst alle Transfers prüfen bevor wir löschen
+        dropbox_ok = True
+        paperless_ok = True
 
-        # 3) Temporäre Seiten löschen
         for f in output_files:
             try:
-                os.remove(f)
-            except Exception:
-                pass
+                copy_to_dropbox(f)
+            except Exception as e:
+                log.error(f"  ✗ Dropbox Fehler: {e}")
+                dropbox_ok = False
 
-        # 4) OCR-Zwischendatei löschen
-        if ocr_path:
             try:
-                os.remove(ocr_path)
-            except Exception:
-                pass
+                copy_to_paperless(f)
+            except Exception as e:
+                log.error(f"  ✗ SFTP Fehler: {e}")
+                paperless_ok = False
 
-        # 5) Original löschen
-        os.remove(file_path)
-        log.info(f"  ✓ Original gelöscht: {file_path}")
+        # 4) Nur löschen wenn beide Endpoints erfolgreich waren
+        if dropbox_ok and paperless_ok:
+            for f in output_files:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+            if ocr_path:
+                try:
+                    os.remove(ocr_path)
+                except Exception:
+                    pass
+            os.remove(file_path)
+            log.info(f"  ✓ Verarbeitung abgeschlossen, Original gelöscht: {file_path}")
+        else:
+            log.warning("  ⚠ Nicht alle Endpoints erfolgreich – Original wird NICHT gelöscht")
 
     except Exception as e:
         log.error(f"  ✗ Fehler bei Verarbeitung: {e}")
-        # Bei Fehler: keine Dateien löschen, außer ggf. die erzeugten Splits (optional)
-        # (Hier lassen wir absichtlich alles liegen, damit du debuggen kannst.)
 
 # ─────────────────────────────────────────────
 # FOLDER WATCHER
@@ -297,7 +349,8 @@ class PDFHandler(FileSystemEventHandler):
         if TEMP_FOLDER in event.src_path:
             return
 
-        process_pdf(event.src_path)
+        # Nicht direkt verarbeiten – in Warteschlange legen
+        add_to_queue(event.src_path)
 
 # ─────────────────────────────────────────────
 # START
@@ -306,12 +359,19 @@ class PDFHandler(FileSystemEventHandler):
 if __name__ == "__main__":
     log.info("=" * 50)
     log.info("Scan Pipeline gestartet (mit OCR)")
-    log.info(f"Überwache: {WATCH_FOLDER}")
-    log.info(f"Dropbox:   {DROPBOX_FOLDER}")
-    log.info(f"Paperless: {LINUX_USER}@{LINUX_HOST}:{LINUX_CONSUME_PATH}")
-    log.info(f"OCR Bin:   {OCRMY_PDF_BIN}")
+    log.info(f"Überwache:    {WATCH_FOLDER}")
+    log.info(f"Dropbox:      {DROPBOX_FOLDER}")
+    log.info(f"Paperless:    {LINUX_USER}@{LINUX_HOST}:{LINUX_CONSUME_PATH}")
+    log.info(f"OCR Bin:      {OCRMY_PDF_BIN}")
+    log.info(f"Queue-Check:  alle {QUEUE_CHECK_INTERVAL}s")
+    log.info(f"Stabil nach:  {FILE_STABLE_SECONDS}s")
     log.info("=" * 50)
 
+    # Hintergrund-Thread für Warteschlange starten
+    worker = threading.Thread(target=queue_worker, daemon=True)
+    worker.start()
+
+    # Folder Watcher starten
     observer = Observer()
     observer.schedule(PDFHandler(), WATCH_FOLDER, recursive=False)
     observer.start()
